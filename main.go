@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/nsf/jsondiff"
 	"io"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -118,12 +121,18 @@ func writeInitialFileContent(fileName string, typedObj *unstructured.Unstructure
 		panic(err)
 	}
 
-	bytes, err := typedObj.MarshalJSON()
+	jsonBytes, err := typedObj.MarshalJSON()
 	if err != nil {
 		panic(err)
 	}
 
-	_, err = out.Write(bytes)
+	var prettyJson bytes.Buffer
+	err = json.Indent(&prettyJson, jsonBytes, "", "\t")
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = out.Write(prettyJson.Bytes())
 	if err != nil {
 		fmt.Printf("Error while writing resource to %s: %s\n", fileName, err.Error())
 		_, err := out.WriteString(fmt.Sprintf("kpersist: error occurred while writing this log file: %s", err.Error()))
@@ -156,11 +165,11 @@ func processResourceModifications(out *os.File, ch chan *unstructured.Unstructur
 		options.SkipMatches = true
 		_, diffs := jsondiff.Compare(prevJson, currJson, &options)
 
-		_, err = out.WriteString(fmt.Sprintf("----------------------------------\nChange captured at %s:\n", time.Now().Format(time.RFC3339Nano)))
+		_, err = out.WriteString(fmt.Sprintf("\n----------------------------------\nChange captured at %s:\n", time.Now().Format(time.RFC3339Nano)))
 		if err != nil {
 			panic(err)
 		}
-		_, err = out.WriteString(fmt.Sprintf("%s\n----------------------------------", diffs))
+		_, err = out.WriteString(fmt.Sprintf("%s\n----------------------------------\n", diffs))
 		if err != nil {
 			fmt.Printf("Error while writing resource to %s: %s\n", out.Name(), err.Error())
 			_, err := out.WriteString(fmt.Sprintf("kpersist: error occurred while writing this log file: %s", err.Error()))
@@ -179,9 +188,9 @@ func processResourceModifications(out *os.File, ch chan *unstructured.Unstructur
 	}
 }
 
-func watchPodsForLogs(c context.Context, path string, clientset *kubernetes.Clientset) {
+func watchPodsForLogs(ctx context.Context, basePath string, clientset *kubernetes.Clientset) {
 	// TODO allow setting selectors
-	watcher, err := clientset.CoreV1().Pods("").Watch(c, metav1.ListOptions{LabelSelector: "camel.apache.org/integration"})
+	watcher, err := clientset.CoreV1().Pods("").Watch(ctx, metav1.ListOptions{LabelSelector: "camel.apache.org/integration"})
 	if err != nil {
 		panic(err)
 	}
@@ -189,19 +198,47 @@ func watchPodsForLogs(c context.Context, path string, clientset *kubernetes.Clie
 	for event := range watcher.ResultChan() {
 		fmt.Printf("Watch Pod Event: %s\n", event.Type)
 		if event.Type == watch.Added {
-			pod := event.Object.(*v1.Pod)
-			req := clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &v1.PodLogOptions{Follow: true})
-			go followAndPersistPodLog(c, path, pod, req)
+			pod := event.Object.(*corev1.Pod)
+			for _, container := range pod.Spec.Containers {
+				logRequest := clientset.CoreV1().
+					Pods(pod.Namespace).
+					GetLogs(
+						pod.Name,
+						&corev1.PodLogOptions{
+							Follow:    true,
+							Container: container.Name,
+						},
+					)
+				go followAndPersistContainerLog(ctx, basePath, pod, container, logRequest)
+			}
 		}
 	}
 }
 
-func followAndPersistPodLog(c context.Context, path string, pod *v1.Pod, logRequest *rest.Request) {
+func followAndPersistContainerLog(c context.Context, path string, pod *corev1.Pod, container corev1.Container, logRequest *rest.Request) {
+	for {
+		var containerStatus corev1.ContainerStatus
+		for _, cStatus := range pod.Status.ContainerStatuses {
+			if cStatus.Name == container.Name {
+				containerStatus = cStatus
+			}
+			break
+		}
+		if *containerStatus.Started {
+			break
+		}
+		// wait until container is available
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	logStream, err := logRequest.Stream(c)
-	defer logStream.Close()
 	if err != nil {
+		if v, ok := err.(errors.APIStatus); ok {
+			fmt.Printf("%+v", v)
+		}
 		panic(err)
 	}
+	defer logStream.Close()
 
 	fileName := filepath.Join(path, fmt.Sprintf("pod_%s.txt", pod.Name))
 	fmt.Printf("Writing to file %s\n", fileName)
@@ -213,19 +250,26 @@ func followAndPersistPodLog(c context.Context, path string, pod *v1.Pod, logRequ
 		panic(err)
 	}
 
-	_, err = io.Copy(out, logStream)
-	if err != nil {
-		fmt.Printf("Error while writing logs to %s: %s\n", fileName, err.Error())
-		_, err := out.WriteString(fmt.Sprintf("kpersist: error occurred while writing this log file: %s", err.Error()))
+	for {
+		_, err = io.Copy(out, logStream)
 		if err != nil {
+			fmt.Printf("Error while writing logs to %s: %s\n", fileName, err.Error())
+			_, err := out.WriteString(fmt.Sprintf("kpersist: error occurred while writing this log file: %s", err.Error()))
+			if err != nil {
+				panic(err)
+			}
+			err = out.Sync()
+			if err != nil {
+				panic(err)
+			}
 			panic(err)
 		}
-		err = out.Sync()
-		if err != nil {
-			panic(err)
-		}
-		panic(err)
+		time.Sleep(500 * time.Millisecond)
 	}
+
+	s := fmt.Sprintf("Done writing logs from pod %s", pod.Name)
+	fmt.Println(s)
+	out.WriteString(s)
 
 	err = out.Sync()
 	if err != nil {
