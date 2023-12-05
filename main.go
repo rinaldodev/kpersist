@@ -6,9 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/nsf/jsondiff"
-	"io"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -18,6 +16,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -199,80 +198,62 @@ func watchPodsForLogs(ctx context.Context, basePath string, clientset *kubernete
 		fmt.Printf("Watch Pod Event: %s\n", event.Type)
 		if event.Type == watch.Added {
 			pod := event.Object.(*corev1.Pod)
-			for _, container := range pod.Spec.Containers {
-				logRequest := clientset.CoreV1().
-					Pods(pod.Namespace).
-					GetLogs(
-						pod.Name,
-						&corev1.PodLogOptions{
-							Follow:    true,
-							Container: container.Name,
-						},
-					)
-				go followAndPersistContainerLog(ctx, basePath, pod, container, logRequest)
-			}
+			//for _, container := range pod.Spec.Containers {
+			logRequest := clientset.CoreV1().
+				Pods(pod.Namespace).
+				GetLogs(
+					pod.Name,
+					&corev1.PodLogOptions{
+						Follow: true,
+						//				Container: container.Name,
+					},
+				)
+			//go followAndPersistContainerLog(ctx, basePath, pod, container, logRequest)
+			go followAndPersistContainerLog(ctx, basePath, pod, logRequest)
+			//}
 		}
 	}
 }
 
-func followAndPersistContainerLog(c context.Context, path string, pod *corev1.Pod, container corev1.Container, logRequest *rest.Request) {
-	for {
-		var containerStatus corev1.ContainerStatus
-		for _, cStatus := range pod.Status.ContainerStatuses {
-			if cStatus.Name == container.Name {
-				containerStatus = cStatus
-			}
-			break
-		}
-		if *containerStatus.Started {
-			break
-		}
-		// wait until container is available
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	logStream, err := logRequest.Stream(c)
-	if err != nil {
-		if v, ok := err.(errors.APIStatus); ok {
-			fmt.Printf("%+v", v)
-		}
-		panic(err)
-	}
-	defer logStream.Close()
+func followAndPersistContainerLog(c context.Context, path string, pod *corev1.Pod, logRequest *rest.Request) {
 
 	fileName := filepath.Join(path, fmt.Sprintf("pod_%s.txt", pod.Name))
 	fmt.Printf("Writing to file %s\n", fileName)
 
 	out, err := os.Create(fileName)
-	defer out.Close()
 	if err != nil {
 		fmt.Printf("Error while creating file %s: %s\n", fileName, err.Error())
 		panic(err)
 	}
+	defer out.Close()
+	defer out.Sync()
 
-	for {
-		_, err = io.Copy(out, logStream)
-		if err != nil {
-			fmt.Printf("Error while writing logs to %s: %s\n", fileName, err.Error())
-			_, err := out.WriteString(fmt.Sprintf("kpersist: error occurred while writing this log file: %s", err.Error()))
-			if err != nil {
-				panic(err)
-			}
-			err = out.Sync()
-			if err != nil {
-				panic(err)
-			}
-			panic(err)
-		}
-		time.Sleep(500 * time.Millisecond)
+	cmd := exec.CommandContext(
+		c,
+		"kubectl",
+		"logs",
+		pod.Name,
+		"--follow=true",
+		"--all-containers=true",
+		"--ignore-errors=true",
+		"--pod-running-timeout=5m",
+		"--prefix=true",
+		//"--previous=true",
+		"--timestamps=true",
+	)
+
+	cmd.Stdout = out
+	cmd.Stderr = out
+
+	err = cmd.Run()
+	if err != nil {
+		s := fmt.Sprintf("Error when trying to get logs from pod %s: %+v", pod.Name, err)
+		fmt.Println(s)
+		out.WriteString(s)
+		return
 	}
 
 	s := fmt.Sprintf("Done writing logs from pod %s", pod.Name)
 	fmt.Println(s)
 	out.WriteString(s)
-
-	err = out.Sync()
-	if err != nil {
-		panic(err)
-	}
 }
