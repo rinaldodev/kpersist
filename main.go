@@ -11,10 +11,12 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -38,44 +40,58 @@ func main() {
 
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		panic(err)
+		slog.ErrorContext(c, "Error getting k8s config from path", "error", err, "kubeconfig path", kubeconfig)
+		os.Exit(1)
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		panic(err)
+		slog.ErrorContext(c, "Error creating k8s clientset for config", "error", err, "config", config)
+		os.Exit(1)
 	}
+
+	forConfig, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return
+	}
+	forConfig.
 
 	dclient, err := dynamic.NewForConfig(config)
 	if err != nil {
-		panic(err)
+		slog.ErrorContext(c, "Error creating k8s dynamic client for config", "error", err, "config", config)
+		os.Exit(1)
 	}
 
 	path := filepath.Join(BasePath, time.Now().Format("20060102_150405.00000"))
-	fmt.Printf("Creating directory for storing files: %s\n", path)
+	slog.InfoContext(c, "Creating directory for storing files", "path", path)
+
 	err = os.MkdirAll(path, os.ModePerm)
 	if err != nil {
-		panic(err)
+		slog.ErrorContext(c, "Error creating directory for storing files", "error", err, "path", path)
+		os.Exit(1)
 	}
 
+	slog.InfoContext(c, "Initializing resource watchers")
 	go watchResources(c, path, dclient)
+
+	slog.InfoContext(c, "Initializing logs persisters")
 	go watchPodsForLogs(c, path, clientset)
 
 	<-c.Done()
 }
 
 func watchResources(c context.Context, path string, dclient *dynamic.DynamicClient) {
+	resource := schema.GroupVersionResource{
+		Group:    "camel.apache.org",
+		Version:  "v1",
+		Resource: "integrations",
+	}
+
 	watcher, err := dclient.
-		// TODO generalize to any kind of resource
-		Resource(
-			schema.GroupVersionResource{
-				Group:    "camel.apache.org",
-				Version:  "v1",
-				Resource: "integrations",
-			}).
+		Resource(resource).
 		Watch(c, metav1.ListOptions{})
 	if err != nil {
-		panic(err)
+		slog.ErrorContext(c, "Failed to create watcher for resource", "error", err, "resource", resource)
 	}
 
 	channels := map[string]chan *unstructured.Unstructured{}
