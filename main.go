@@ -10,17 +10,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -50,11 +50,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	forConfig, err := discovery.NewDiscoveryClientForConfig(config)
-	if err != nil {
-		return
-	}
-	forConfig.
+	//forConfig, err := discovery.NewDiscoveryClientForConfig(config)
+	//if err != nil {
+	//	return
+	//}
+	//forConfig.
 
 	dclient, err := dynamic.NewForConfig(config)
 	if err != nil {
@@ -106,7 +106,8 @@ func watchResources(c context.Context, path string, dclient *dynamic.DynamicClie
 			name := typedObj.GetName()
 			ch := make(chan *unstructured.Unstructured, 10)
 
-			fileName := filepath.Join(path, fmt.Sprintf("integration_%s.txt", name))
+			time := time.Now().Format("20060102_150405.00000")
+			fileName := filepath.Join(path, fmt.Sprintf("%s_integration_%s.txt", time, name))
 			fmt.Printf("Writing to file %s\n", fileName)
 
 			file := writeInitialFileContent(fileName, typedObj)
@@ -136,6 +137,7 @@ func writeInitialFileContent(fileName string, typedObj *unstructured.Unstructure
 		panic(err)
 	}
 
+	typedObj.SetManagedFields(nil)
 	jsonBytes, err := typedObj.MarshalJSON()
 	if err != nil {
 		panic(err)
@@ -162,6 +164,7 @@ func writeInitialFileContent(fileName string, typedObj *unstructured.Unstructure
 
 func processResourceModifications(out *os.File, ch chan *unstructured.Unstructured, obj *unstructured.Unstructured) {
 	prev := obj
+	prev.SetManagedFields(nil)
 
 	defer out.Close()
 
@@ -170,6 +173,8 @@ func processResourceModifications(out *os.File, ch chan *unstructured.Unstructur
 		if err != nil {
 			panic(err)
 		}
+
+		curr.SetManagedFields(nil)
 
 		currJson, err := curr.MarshalJSON()
 		if err != nil {
@@ -203,6 +208,12 @@ func processResourceModifications(out *os.File, ch chan *unstructured.Unstructur
 	}
 }
 
+type watchedPod struct {
+	cond     *sync.Cond
+	pod      *corev1.Pod
+	canRetry bool
+}
+
 func watchPodsForLogs(ctx context.Context, basePath string, clientset *kubernetes.Clientset) {
 	// TODO allow setting selectors
 	watcher, err := clientset.CoreV1().Pods("").Watch(ctx, metav1.ListOptions{LabelSelector: "camel.apache.org/integration"})
@@ -210,30 +221,52 @@ func watchPodsForLogs(ctx context.Context, basePath string, clientset *kubernete
 		panic(err)
 	}
 
+	pods := map[types.UID]*watchedPod{}
+
 	for event := range watcher.ResultChan() {
 		fmt.Printf("Watch Pod Event: %s\n", event.Type)
 		if event.Type == watch.Added {
 			pod := event.Object.(*corev1.Pod)
-			//for _, container := range pod.Spec.Containers {
-			logRequest := clientset.CoreV1().
-				Pods(pod.Namespace).
-				GetLogs(
-					pod.Name,
-					&corev1.PodLogOptions{
-						Follow: true,
-						//				Container: container.Name,
-					},
-				)
-			//go followAndPersistContainerLog(ctx, basePath, pod, container, logRequest)
-			go followAndPersistContainerLog(ctx, basePath, pod, logRequest)
-			//}
+
+			wp := watchedPod{
+				pod:      pod,
+				cond:     sync.NewCond(&sync.Mutex{}),
+				canRetry: true,
+			}
+
+			pods[pod.UID] = &wp
+
+			go followAndPersistContainerLog(ctx, basePath, wp)
+		}
+		if event.Type == watch.Modified {
+			pod := event.Object.(*corev1.Pod)
+			wp := pods[pod.UID]
+			if wp != nil {
+				wp.cond.Signal()
+			} else {
+				fmt.Printf("Pod modified that wasn't previously known: %s/%s", pod.Name, pod.UID)
+			}
+		}
+		if event.Type == watch.Deleted {
+			pod := event.Object.(*corev1.Pod)
+			wp := pods[pod.UID]
+			if wp != nil {
+				wp.cond.L.Lock()
+				wp.canRetry = false
+				wp.cond.L.Unlock()
+				wp.cond.Signal()
+				delete(pods, pod.UID)
+			} else {
+				fmt.Printf("Pod deleted that wasn't previously known: %s/%s", pod.Name, pod.UID)
+			}
 		}
 	}
 }
 
-func followAndPersistContainerLog(c context.Context, path string, pod *corev1.Pod, logRequest *rest.Request) {
+func followAndPersistContainerLog(c context.Context, basePath string, wp watchedPod) {
 
-	fileName := filepath.Join(path, fmt.Sprintf("pod_%s.txt", pod.Name))
+	time := time.Now().Format("20060102_150405.00000")
+	fileName := filepath.Join(basePath, fmt.Sprintf("%s_pod_%s.txt", time, wp.pod.Name))
 	fmt.Printf("Writing to file %s\n", fileName)
 
 	out, err := os.Create(fileName)
@@ -244,32 +277,75 @@ func followAndPersistContainerLog(c context.Context, path string, pod *corev1.Po
 	defer out.Close()
 	defer out.Sync()
 
-	cmd := exec.CommandContext(
+	wp.cond.L.Lock()
+	defer wp.cond.L.Unlock()
+	for cont := true; cont; cont = wp.canRetry {
+		execKubectl(c, wp, out)
+		wp.cond.Wait()
+	}
+
+	s := fmt.Sprintf("Done writing logs from pod %s", wp.pod.Name)
+	fmt.Println(s)
+	out.WriteString(s)
+}
+
+func execKubectl(c context.Context, wp watchedPod, out *os.File) {
+	kubectl := exec.CommandContext(
 		c,
 		"kubectl",
 		"logs",
-		pod.Name,
+		wp.pod.Name,
+		"-n="+wp.pod.Namespace,
 		"--follow=true",
 		"--all-containers=true",
 		"--ignore-errors=true",
 		"--pod-running-timeout=5m",
 		"--prefix=true",
-		//"--previous=true",
 		"--timestamps=true",
 	)
 
-	cmd.Stdout = out
-	cmd.Stderr = out
+	// sed to remove colors
+	sed := exec.CommandContext(
+		c,
+		"sed",
+		"s/\\x1B\\[[0-9;]\\{1,\\}[A-Za-z]//g",
+	)
 
-	err = cmd.Run()
+	// pipe kubectl output to sed input
+	var err error
+	sed.Stdin, err = kubectl.StdoutPipe()
 	if err != nil {
-		s := fmt.Sprintf("Error when trying to get logs from pod %s: %+v", pod.Name, err)
+		fmt.Printf("Error getting logs: %s\n", err.Error())
+		panic(err)
+	}
+
+	// write sed and all errors to file (out)
+	kubectl.Stderr = out
+	sed.Stdout = out
+	sed.Stderr = out
+
+	err = sed.Start()
+	if err != nil {
+		s := fmt.Sprintf("Error when trying to get logs from pod %s: %+v", wp.pod.Name, err)
 		fmt.Println(s)
 		out.WriteString(s)
 		return
 	}
 
-	s := fmt.Sprintf("Done writing logs from pod %s", pod.Name)
-	fmt.Println(s)
-	out.WriteString(s)
+	defer func() {
+		err = sed.Wait()
+		if err != nil {
+			s := fmt.Sprintf("Error when trying to get logs from pod %s: %+v", wp.pod.Name, err)
+			fmt.Println(s)
+			out.WriteString(s)
+		}
+	}()
+
+	err = kubectl.Run()
+	if err != nil {
+		s := fmt.Sprintf("Error when trying to get logs from pod %s: %+v", wp.pod.Name, err)
+		fmt.Println(s)
+		out.WriteString(s)
+		return
+	}
 }
